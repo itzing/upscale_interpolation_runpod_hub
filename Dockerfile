@@ -56,6 +56,6 @@ WORKDIR /
 COPY . .
 RUN mkdir -p /ComfyUI/user/default/ComfyUI-Manager
 COPY config.ini /ComfyUI/user/default/ComfyUI-Manager/config.ini
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh /scripts/start_comfy_ram.sh /scripts/finish_cleanup.sh
 
 CMD ["/entrypoint.sh"]

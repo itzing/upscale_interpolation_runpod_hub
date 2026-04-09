@@ -1,187 +1,219 @@
-# Video Upscale & Frame Interpolation for RunPod Serverless
+# Video and Image Upscale for RunPod Serverless
 [한국어 README 보기](README_kr.md)
 
-This project is a RunPod Serverless template for video upscaling and frame interpolation using ComfyUI.
+This repository provides a RunPod Serverless worker for:
+- image upscale
+- video upscale
+- video upscale plus frame interpolation
 
-[![Runpod](https://api.runpod.io/badge/wlsdml1114/upscale_interpolation_runpod_hub)](https://console.runpod.io/hub/wlsdml1114/upscale_interpolation_runpod_hub)
+It is adapted for Engui Studio and now supports the same secure request and result contract style used by `ZImage_runpod-zimage`.
 
-## 🎨 Engui Studio Integration
+## Features
 
-[![EnguiStudio](https://raw.githubusercontent.com/wlsdml1114/Engui_Studio/main/assets/banner.png)](https://github.com/wlsdml1114/Engui_Studio)
+- ComfyUI-based workflows
+- image input and video input support
+- base64, URL, or path inputs
+- AES-256-GCM secure request envelope via `_secure`
+- AES-256-GCM encrypted result payloads
+- masked request logging
+- prompt-id scoped cleanup hook
+- RAM-backed ComfyUI runtime support
 
-This InfiniteTalk template is primarily designed for **Engui Studio**, a comprehensive AI model management platform. While it can be used via API, Engui Studio provides enhanced features and broader model support.
+## Main files
 
-**Engui Studio Benefits:**
-- **Expanded Model Support**: Access to a wider variety of AI models beyond what's available through API
-- **Enhanced User Interface**: Intuitive workflow management and model selection
-- **Advanced Features**: Additional tools and capabilities for AI model deployment
-- **Seamless Integration**: Optimized for Engui Studio's ecosystem
+- `handler.py` - RunPod worker entrypoint
+- `entrypoint.sh` - container startup
+- `scripts/start_comfy_ram.sh` - starts ComfyUI with RAM-backed runtime dirs
+- `scripts/finish_cleanup.sh` - prompt history delete + runtime cleanup
+- `workflow/image_upscale.json`
+- `workflow/video_upscale_api.json`
+- `workflow/video_upscale_interpolation_api.json`
 
-> **Note**: While this template works perfectly with API calls, Engui Studio users will have access to additional models and features that are planned for future releases.
+## Input contract
 
-## ✨ Key Features
+The worker accepts either image or video input.
 
-*   **Video Upscaling**: High-quality video upscaling for resolution enhancement
-*   **Frame Interpolation**: Natural frame interpolation using RIFE model
-*   **ComfyUI Integration**: Flexible workflow management based on ComfyUI
-*   **VHS Support**: Efficient video processing using Video Helper Suite
-*   **Multiple Input Formats**: Support for Base64, URL, and file path inputs
+### Image input
+Use one of:
+- `image_path`
+- `image_url`
+- `image_base64`
 
-## 🚀 RunPod Serverless Template
+### Video input
+Use one of:
+- `video_path`
+- `video_url`
+- `video_base64`
 
-This template includes all necessary components to run video upscaling and frame interpolation as a RunPod Serverless Worker.
+### Common fields
+- `task_type`
+  - for video: `upscale` or `upscale_and_interpolation`
+  - image input always maps to image upscale
+- `output`
+  - `base64` returns inline result payload
+  - `file_path` returns `image_path` or `video_path`
 
-*   **Dockerfile**: Environment configuration and installation of all dependencies required for model execution
-*   **handler.py**: Handler function that processes requests for RunPod Serverless
-*   **entrypoint.sh**: Performs initialization tasks when the worker starts
-*   **upscale.json**: Video upscaling only workflow configuration
-*   **upscale_and_interpolation.json**: Upscaling + frame interpolation workflow configuration
+## Secure request contract
 
-### Input
+When secure mode is enabled, Engui sends sensitive fields inside `_secure`.
 
-The `input` object must contain the following fields. Videos can be input using **path, URL, or Base64** - one method for each.
+### `_secure` shape
 
-#### Workflow Selection Parameters
-| Parameter | Type | Required | Default | Description |
-| --- | --- | --- | --- | --- |
-| `task_type` | `string` | No | `"upscale"` | Task type: `"upscale"` (upscaling only) or `"upscale_and_interpolation"` (upscaling + frame interpolation) |
-| `network_volume` | `boolean` | No | `false` | Whether to use network volume for output. If `true`, returns file path; if `false`, returns Base64 encoded data |
+```json
+{
+  "v": 1,
+  "alg": "AES-256-GCM",
+  "kid": "upscale-k1",
+  "ts": 1712660000,
+  "nonce": "...base64...",
+  "ciphertext": "...base64..."
+}
+```
 
-#### Video Input (use only one)
-| Parameter | Type | Required | Default | Description |
-| --- | --- | --- | --- | --- |
-| `video_path` | `string` | No | `/example_video.mp4` | Local path to the input video file |
-| `video_url` | `string` | No | `/example_video.mp4` | URL to the input video file |
-| `video_base64` | `string` | No | `/example_video.mp4` | Base64 encoded string of the input video file |
+### Request AAD
 
-**Request Examples:**
+```text
+engui:upscale-interpolation:v1
+```
 
-#### 1. Upscaling Only (using URL)
+### Recommended encrypted fields
+
+- `image_base64`
+- `video_base64`
+- optionally `image_url`
+- optionally `video_url`
+
+### Required env vars for request decrypt
+
+- `UPSCALE_FIELD_ENC_KEY_B64`
+- or fallback `FIELD_ENC_KEY_B64`
+
+The key must decode to exactly 32 bytes.
+
+## Result contract
+
+When `output=base64` and an encryption key is configured, the worker returns encrypted media blocks instead of plaintext media.
+
+### Encrypted image result
+
+```json
+{
+  "image_encrypted": {
+    "v": 1,
+    "alg": "AES-256-GCM",
+    "kid": "upscale-k1",
+    "nonce": "...base64...",
+    "ciphertext": "...base64...",
+    "mime": "image/png"
+  }
+}
+```
+
+AAD:
+
+```text
+engui:upscale-interpolation:image-result:v1
+```
+
+### Encrypted video result
+
+```json
+{
+  "video_encrypted": {
+    "v": 1,
+    "alg": "AES-256-GCM",
+    "kid": "upscale-k1",
+    "nonce": "...base64...",
+    "ciphertext": "...base64...",
+    "mime": "video/mp4"
+  }
+}
+```
+
+AAD:
+
+```text
+engui:upscale-interpolation:video-result:v1
+```
+
+### Plaintext fallback
+
+If no encryption key is configured and `output=base64`, the worker falls back to plaintext:
+- `image`
+- `video`
+
+If `output=file_path`, the worker returns:
+- `image_path`
+- `video_path`
+
+## Runtime layout
+
+Recommended runtime env:
+
+- `RUNTIME_ROOT=/dev/shm/comfy-runtime`
+- `INPUT_DIR=/dev/shm/comfy-runtime/input`
+- `OUTPUT_DIR=/dev/shm/comfy-runtime/output`
+- `TEMP_DIR=/dev/shm/comfy-runtime/temp`
+- `USER_DIR=/dev/shm/comfy-runtime/user`
+
+`entrypoint.sh` starts ComfyUI through `scripts/start_comfy_ram.sh` by default.
+
+## Cleanup behavior
+
+After each job, the worker attempts to:
+- delete current prompt history only
+- clear runtime input/output/temp dirs
+- request ComfyUI memory free / model unload
+- log cleanup verification details
+
+Cleanup script path can be overridden with:
+- `FINISH_CLEANUP_SCRIPT`
+
+## Example requests
+
+### Image upscale via plaintext base64
+
+```json
+{
+  "input": {
+    "image_base64": "...",
+    "output": "base64"
+  }
+}
+```
+
+### Video upscale via secure payload
+
 ```json
 {
   "input": {
     "task_type": "upscale",
-    "video_url": "https://sample-videos.com/zip/10/mp4/SampleVideo_1280x720_1mb.mp4"
+    "output": "base64",
+    "_secure": {
+      "v": 1,
+      "alg": "AES-256-GCM",
+      "kid": "upscale-k1",
+      "ts": 1712660000,
+      "nonce": "...",
+      "ciphertext": "..."
+    }
   }
 }
 ```
 
-#### 2. Upscaling + Frame Interpolation (using file path)
+### Video upscale plus interpolation via file path
+
 ```json
 {
   "input": {
     "task_type": "upscale_and_interpolation",
-    "video_path": "/my_volume/input_video.mp4"
+    "video_path": "/runpod-volume/input.mp4",
+    "output": "file_path"
   }
 }
 ```
 
-#### 3. Using Base64 (Upscaling Only)
-```json
-{
-  "input": {
-    "task_type": "upscale",
-    "video_base64": "data:video/mp4;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
-  }
-}
-```
+## Remaining notes
 
-#### 4. Using Network Volume (File Path Output)
-```json
-{
-  "input": {
-    "task_type": "upscale_and_interpolation",
-    "video_path": "/my_volume/input_video.mp4",
-    "network_volume": true
-  }
-}
-```
-
-### Output
-
-#### Success
-
-If the job is successful, it returns a JSON object. The response format depends on the `network_volume` parameter.
-
-**When `network_volume: true`:**
-
-| Parameter | Type | Description |
-| --- | --- | --- |
-| `video_path` | `string` | Path to the generated video file |
-
-```json
-{
-  "video_path": "/runpod-volume/upscale_e5f6c1c3-e784-4e90-96a7-32f0be222d3c.mp4"
-}
-```
-
-**When `network_volume: false` (default):**
-
-| Parameter | Type | Description |
-| --- | --- | --- |
-| `video` | `string` | Base64 encoded video file data |
-
-```json
-{
-  "video": "data:video/mp4;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
-}
-```
-
-#### Error
-
-If the job fails, it returns a JSON object containing an error message.
-
-| Parameter | Type | Description |
-| --- | --- | --- |
-| `error` | `string` | Description of the error that occurred |
-
-**Error Response Example:**
-
-```json
-{
-  "error": "비디오를 찾을 수 없습니다."
-}
-```
-
-## 🛠️ Usage and API Reference
-
-1.  Create a Serverless Endpoint on RunPod based on this repository.
-2.  Once the build is complete and the endpoint is active, submit jobs via HTTP POST requests according to the API Reference below.
-
-### 📁 Using Network Volumes
-
-Instead of directly transmitting Base64 encoded files, you can use RunPod's Network Volumes to handle large files. This is especially useful when dealing with large video files.
-
-1.  **Create and Connect Network Volume**: Create a Network Volume (e.g., S3-based volume) from the RunPod dashboard and connect it to your Serverless Endpoint settings.
-2.  **Upload Files**: Upload the video files you want to use to the created Network Volume.
-3.  **Specify Paths**: When making an API request, specify the file paths within the Network Volume for `video_path`. For example, if the volume is mounted at `/my_volume` and you use `input_video.mp4`, the path would be `"/my_volume/input_video.mp4"`.
-
-## 🔧 Workflow Configuration
-
-This template includes two workflow configurations that are automatically selected based on your input parameters:
-
-*   **upscale.json**: Video upscaling only workflow
-*   **upscale_and_interpolation.json**: Upscaling + frame interpolation workflow
-
-### Workflow Selection Logic
-
-The handler automatically selects the appropriate workflow based on your input parameters:
-
-| task_type | Selected Workflow |
-|-----------|-------------------|
-| `"upscale"` | upscale.json |
-| `"upscale_and_interpolation"` | upscale_and_interpolation.json |
-
-The workflows are based on ComfyUI and include all necessary nodes for video upscaling and frame interpolation processing. Each workflow is optimized for its specific use case and includes the appropriate model configurations.
-
-## 🙏 Original Project
-
-This project is based on the following original repositories. All rights to the models and core logic belong to the original authors.
-
-*   **ComfyUI:** [https://github.com/comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI)
-*   **ComfyUI-Frame-Interpolation:** [https://github.com/Fannovel16/ComfyUI-Frame-Interpolation](https://github.com/Fannovel16/ComfyUI-Frame-Interpolation)
-*   **VHS (Video Helper Suite):** [https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite)
-
-## 📄 License
-
-This project follows the Apache 2.0 License.
+This repository is now aligned with the first secure Engui contract pass.
+The next layer of hardening is operational validation in a real deployed RunPod endpoint with the shared key configured on both sides.

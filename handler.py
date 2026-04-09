@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -23,6 +24,10 @@ logger = logging.getLogger(__name__)
 REQUEST_AAD = b'engui:upscale-interpolation:v1'
 IMAGE_RESULT_AAD = b'engui:upscale-interpolation:image-result:v1'
 VIDEO_RESULT_AAD = b'engui:upscale-interpolation:video-result:v1'
+RUNTIME_ROOT = os.getenv('RUNTIME_ROOT', '/dev/shm/comfy-runtime')
+INPUT_DIR = os.getenv('INPUT_DIR', os.path.join(RUNTIME_ROOT, 'input'))
+OUTPUT_DIR = os.getenv('OUTPUT_DIR', os.path.join(RUNTIME_ROOT, 'output'))
+TEMP_DIR = os.getenv('TEMP_DIR', os.path.join(RUNTIME_ROOT, 'temp'))
 
 
 def check_cuda_availability():
@@ -205,9 +210,9 @@ def get_image_path(ws, prompt):
                 filename = image['filename']
                 subfolder = image.get('subfolder', '')
                 if subfolder:
-                    full_path = os.path.join('/ComfyUI/output', subfolder, filename)
+                    full_path = os.path.join(OUTPUT_DIR, subfolder, filename)
                 else:
-                    full_path = os.path.join('/ComfyUI/output', filename)
+                    full_path = os.path.join(OUTPUT_DIR, filename)
                 return full_path, prompt_id
 
     return None, prompt_id
@@ -311,6 +316,116 @@ def cleanup_path(path_value):
         logger.warning(f'Cleanup skipped for {path_value}: {error}')
 
 
+def cleanup_runtime_artifacts(task_id):
+    paths_to_clean = [
+        os.path.abspath(task_id),
+        INPUT_DIR,
+        OUTPUT_DIR,
+        TEMP_DIR,
+        '/ComfyUI/input',
+        '/ComfyUI/output',
+        '/ComfyUI/temp',
+    ]
+
+    for target in paths_to_clean:
+        try:
+            if not os.path.exists(target):
+                continue
+
+            if target in [INPUT_DIR, OUTPUT_DIR, TEMP_DIR, '/ComfyUI/input', '/ComfyUI/output', '/ComfyUI/temp']:
+                for name in os.listdir(target):
+                    path = os.path.join(target, name)
+                    if os.path.isdir(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        try:
+                            os.remove(path)
+                        except FileNotFoundError:
+                            pass
+            else:
+                if os.path.isdir(target):
+                    shutil.rmtree(target, ignore_errors=True)
+                elif os.path.isfile(target):
+                    os.remove(target)
+        except Exception as cleanup_error:
+            logger.warning(f'Cleanup warning for {target}: {cleanup_error}')
+
+
+def collect_db_snapshot():
+    db_paths = {
+        'runtime': os.path.join(RUNTIME_ROOT, 'user', 'comfyui.db'),
+        'legacy': '/ComfyUI/user/comfyui.db',
+    }
+
+    snapshot = {}
+    for key, db_path in db_paths.items():
+        try:
+            if os.path.exists(db_path):
+                snapshot[key] = {
+                    'exists': True,
+                    'size': os.path.getsize(db_path),
+                }
+            else:
+                snapshot[key] = {
+                    'exists': False,
+                    'size': 0,
+                }
+        except Exception as error:
+            snapshot[key] = {'error': error.__class__.__name__}
+
+    return snapshot
+
+
+def diff_db_snapshot(before, after):
+    output = {}
+    for key in set(before.keys()) | set(after.keys()):
+        before_item = before.get(key, {})
+        after_item = after.get(key, {})
+        output[key] = {
+            'before': before_item,
+            'after': after_item,
+        }
+        if isinstance(before_item, dict) and isinstance(after_item, dict) and 'size' in before_item and 'size' in after_item:
+            output[key]['size_delta'] = after_item['size'] - before_item['size']
+    return output
+
+
+def collect_cleanup_state():
+    state = {
+        'history_count': None,
+        'files': {},
+        'db': {},
+    }
+
+    try:
+        url = f'http://{server_address}:8188/history'
+        with urllib.request.urlopen(url, timeout=5) as response:
+            history = json.loads(response.read())
+        state['history_count'] = len(history) if isinstance(history, dict) else -1
+    except Exception as error:
+        state['history_count'] = f'error:{error.__class__.__name__}'
+
+    for folder_name, path in [('input', INPUT_DIR), ('output', OUTPUT_DIR), ('temp', TEMP_DIR)]:
+        try:
+            state['files'][folder_name] = len(os.listdir(path)) if os.path.isdir(path) else 'missing'
+        except Exception as error:
+            state['files'][folder_name] = f'error:{error.__class__.__name__}'
+
+    for key, db_path in {
+        'runtime': os.path.join(RUNTIME_ROOT, 'user', 'comfyui.db'),
+        'legacy': '/ComfyUI/user/comfyui.db',
+    }.items():
+        try:
+            if os.path.exists(db_path):
+                state['db'][key] = {'exists': True, 'size': os.path.getsize(db_path)}
+            else:
+                state['db'][key] = {'exists': False}
+        except Exception as error:
+            state['db'][key] = {'error': error.__class__.__name__}
+
+    return state
+
+
 def handler(job):
     raw_job_input = job.get('input', {})
     logger.info(f'Received job input (masked): {mask_job_input_for_log(raw_job_input)}')
@@ -320,7 +435,9 @@ def handler(job):
 
     comfyui_input_path = None
     result_path = None
+    prompt_id = None
     ws = None
+    db_snapshot_before = collect_db_snapshot()
 
     try:
         job_input = decrypt_secure_input(dict(raw_job_input))
@@ -437,7 +554,7 @@ def handler(job):
         else:
             return {'error': f'Unsupported task type: {task_type}'}
 
-        comfyui_input_dir = '/ComfyUI/input'
+        comfyui_input_dir = INPUT_DIR
         os.makedirs(comfyui_input_dir, exist_ok=True)
         input_filename = os.path.basename(input_path)
         comfyui_input_path = os.path.join(comfyui_input_dir, input_filename)
@@ -448,11 +565,11 @@ def handler(job):
         ws = connect_websocket()
 
         if input_type == 'image':
-            result_path, _prompt_id = get_image_path(ws, prompt)
+            result_path, prompt_id = get_image_path(ws, prompt)
             result_key = 'image_path'
             result_base64_key = 'image'
         else:
-            result_path, _prompt_id = get_video_path(ws, prompt)
+            result_path, prompt_id = get_video_path(ws, prompt)
             result_key = 'video_path'
             result_base64_key = 'video'
 
@@ -516,12 +633,33 @@ def handler(job):
             except Exception:
                 pass
 
+        try:
+            cleanup_script = os.getenv('FINISH_CLEANUP_SCRIPT', '/scripts/finish_cleanup.sh')
+            if os.path.exists(cleanup_script):
+                subprocess.run([
+                    cleanup_script,
+                    prompt_id or ''
+                ], check=False, env={**os.environ, 'COMFY_BASE_URL': f'http://{server_address}:8188'})
+        except Exception as cleanup_script_error:
+            logger.warning(f'Cleanup script warning: {cleanup_script_error}')
+
         cleanup_path(comfyui_input_path)
 
-        if result_path and isinstance(result_path, str) and result_path.startswith('/ComfyUI/output/'):
+        if result_path and isinstance(result_path, str) and result_path.startswith(OUTPUT_DIR):
             cleanup_path(result_path)
 
-        cleanup_path(task_id)
+        cleanup_runtime_artifacts(task_id)
+
+        try:
+            cleanup_state = collect_cleanup_state()
+            db_snapshot_after = collect_db_snapshot()
+            db_diff = diff_db_snapshot(db_snapshot_before, db_snapshot_after)
+            logger.info(
+                f"Cleanup verify: history={cleanup_state['history_count']}, "
+                f"files={cleanup_state['files']}, db_diff={db_diff}"
+            )
+        except Exception as cleanup_verify_error:
+            logger.warning(f'Cleanup verify warning: {cleanup_verify_error}')
 
 
 runpod.serverless.start({'handler': handler})

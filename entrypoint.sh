@@ -1,18 +1,33 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Exit immediately if a command exits with a non-zero status.
-set -e
+COMFY_PORT="${COMFY_PORT:-8188}"
+START_COMFY_SCRIPT="${START_COMFY_SCRIPT:-/scripts/start_comfy_ram.sh}"
 
-# Start ComfyUI in the background
-echo "Starting ComfyUI in the background..."
-python /ComfyUI/main.py --listen &
+chmod +x /scripts/start_comfy_ram.sh /scripts/finish_cleanup.sh || true
 
-# Wait for ComfyUI to be ready
+if [[ -x "$START_COMFY_SCRIPT" ]]; then
+  echo "Starting ComfyUI with RAM-backed runtime..."
+  "$START_COMFY_SCRIPT" "$COMFY_PORT" &
+else
+  echo "Fallback: starting ComfyUI directly..."
+  python /ComfyUI/main.py --listen 0.0.0.0 --port "$COMFY_PORT" &
+fi
+
+COMFY_PID=$!
+
+cleanup() {
+  if kill -0 "$COMFY_PID" >/dev/null 2>&1; then
+    kill "$COMFY_PID" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
 echo "Waiting for ComfyUI to be ready..."
-max_wait=120  # 최대 2분 대기
+max_wait=120
 wait_count=0
 while [ $wait_count -lt $max_wait ]; do
-    if curl -s http://127.0.0.1:8188/ > /dev/null 2>&1; then
+    if curl -s "http://127.0.0.1:${COMFY_PORT}/" > /dev/null 2>&1; then
         echo "ComfyUI is ready!"
         break
     fi
@@ -26,7 +41,5 @@ if [ $wait_count -ge $max_wait ]; then
     exit 1
 fi
 
-# Start the handler in the foreground
-# 이 스크립트가 컨테이너의 메인 프로세스가 됩니다.
 echo "Starting the handler..."
 exec python handler.py
