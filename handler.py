@@ -58,6 +58,7 @@ except Exception as error:
 
 server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
 client_id = str(uuid.uuid4())
+WRAPPED_KEY_PREFIX = 'v1:'
 
 
 def mask_job_input_for_log(job_input):
@@ -97,9 +98,72 @@ def decode_encryption_key():
     return key
 
 
+def serialize_binding(binding):
+    return json.dumps(binding, separators=(',', ':'), sort_keys=True).encode('utf-8')
+
+
+def unwrap_dek(master_key, wrapped_key):
+    if not isinstance(wrapped_key, str) or not wrapped_key.startswith(WRAPPED_KEY_PREFIX):
+        raise Exception('Wrapped key prefix is invalid')
+
+    try:
+        payload = base64.b64decode(wrapped_key[len(WRAPPED_KEY_PREFIX):])
+    except Exception as error:
+        raise Exception(f'Wrapped key must be valid base64: {error}')
+
+    if len(payload) <= 28:
+        raise Exception('Wrapped key payload is too short')
+
+    nonce = payload[:12]
+    ciphertext = payload[12:-16]
+    tag = payload[-16:]
+
+    try:
+        return AESGCM(master_key).decrypt(nonce, ciphertext + tag, b'engui:wrapped-key:v1')
+    except Exception as error:
+        raise Exception(f'Failed to unwrap DEK: {error}')
+
+
+def decrypt_structured_envelope(envelope):
+    key = decode_encryption_key()
+    if not key:
+        raise Exception('Secure payload received but FIELD_ENC_KEY_B64 is missing')
+
+    binding = envelope.get('binding')
+    wrapped_key = envelope.get('wrapped_key')
+    nonce_b64 = envelope.get('nonce')
+    ciphertext_b64 = envelope.get('ciphertext')
+
+    if not binding or not wrapped_key or not nonce_b64 or not ciphertext_b64:
+        raise Exception('Structured secure payload is missing required fields')
+
+    dek = unwrap_dek(key, wrapped_key)
+
+    try:
+        nonce = base64.b64decode(nonce_b64)
+        ciphertext = base64.b64decode(ciphertext_b64)
+    except Exception as error:
+        raise Exception(f'Failed to decode structured secure payload: {error}')
+
+    try:
+        plaintext = AESGCM(dek).decrypt(nonce, ciphertext, serialize_binding(binding))
+        return json.loads(plaintext.decode('utf-8'))
+    except Exception as error:
+        raise Exception(f'Failed to decrypt structured secure payload: {error}')
+
+
 def decrypt_secure_input(job_input):
     secure = job_input.get('_secure')
     if not secure:
+        return job_input
+
+    if secure.get('wrapped_key') and secure.get('binding'):
+        payload = decrypt_structured_envelope(secure)
+        for key_name, value in payload.items():
+            job_input[key_name] = value
+
+        job_input['__secure_binding'] = secure.get('binding')
+        job_input.pop('_secure', None)
         return job_input
 
     key = decode_encryption_key()
@@ -142,6 +206,114 @@ def encrypt_output_base64(media_data_base64, aad, mime, default_kid='upscale-k1'
         'ciphertext': base64.b64encode(ciphertext).decode('utf-8'),
         'mime': mime,
     }
+
+
+def encrypt_result_to_transport(plaintext_bytes, job_id, model_id, attempt_id, output_path, kind='image', mime='image/png'):
+    master_key = decode_encryption_key()
+    if not master_key:
+        raise Exception('FIELD_ENC_KEY_B64 is required to encrypt transport result')
+
+    dek = os.urandom(32)
+    binding = {
+        'job_id': job_id,
+        'model_id': model_id,
+        'attempt_id': attempt_id,
+        'direction': 'endpoint_to_engui',
+        'role': 'result',
+        'kind': kind,
+    }
+
+    nonce = os.urandom(12)
+    ciphertext_with_tag = AESGCM(dek).encrypt(nonce, plaintext_bytes, serialize_binding(binding))
+
+    wrap_nonce = os.urandom(12)
+    wrapped_key_payload = AESGCM(master_key).encrypt(wrap_nonce, dek, b'engui:wrapped-key:v1')
+    wrapped_key = WRAPPED_KEY_PREFIX + base64.b64encode(wrap_nonce + wrapped_key_payload).decode('utf-8')
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'wb') as output_file:
+        output_file.write(ciphertext_with_tag)
+
+    return {
+        'status': 'completed',
+        'result_media': {
+            'kind': kind,
+            'mime': mime,
+            'storage_path': output_path,
+            'envelope': {
+                'v': 1,
+                'wrapped_key': wrapped_key,
+                'nonce': base64.b64encode(nonce).decode('utf-8'),
+                'binding': binding,
+            },
+        },
+    }
+
+
+def normalize_transport_failure(code, message):
+    return {
+        'status': 'failed',
+        'error': {
+            'code': code,
+            'message': message,
+        },
+    }
+
+
+def get_transport_request(job_input):
+    transport_request = job_input.get('transport_request') or {}
+    output_dir = transport_request.get('output_dir')
+    if not output_dir or not isinstance(output_dir, str):
+        return None
+    output_dir = output_dir.rstrip('/')
+    if not output_dir.startswith('/runpod-volume/'):
+        raise Exception('transport_request.output_dir must be under /runpod-volume/')
+    return {
+        'output_dir': output_dir,
+    }
+
+
+def decrypt_media_input_to_file(descriptor, output_file_path):
+    key = decode_encryption_key()
+    if not key:
+        raise Exception('Secure media input received but FIELD_ENC_KEY_B64 is missing')
+
+    storage_path = descriptor.get('storage_path')
+    envelope = descriptor.get('envelope') or {}
+    binding = envelope.get('binding')
+    wrapped_key = envelope.get('wrapped_key')
+    nonce_b64 = envelope.get('nonce')
+
+    if not storage_path or not binding or not wrapped_key or not nonce_b64:
+        raise Exception('Secure media input descriptor is incomplete')
+
+    with open(storage_path, 'rb') as input_file:
+        ciphertext_with_tag = input_file.read()
+
+    dek = unwrap_dek(key, wrapped_key)
+    try:
+        nonce = base64.b64decode(nonce_b64)
+    except Exception as error:
+        raise Exception(f'Failed to decode secure media nonce: {error}')
+
+    try:
+        plaintext = AESGCM(dek).decrypt(nonce, ciphertext_with_tag, serialize_binding(binding))
+    except Exception as error:
+        raise Exception(f'Failed to decrypt secure media input: {error}')
+
+    os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+    with open(output_file_path, 'wb') as output_file:
+        output_file.write(plaintext)
+
+    return output_file_path
+
+
+def get_secure_media_input(job_input, roles):
+    media_inputs = job_input.get('media_inputs') or []
+    for descriptor in media_inputs:
+        if descriptor.get('role') in roles:
+            return descriptor
+    return None
 
 
 def queue_prompt(prompt):
@@ -441,9 +613,12 @@ def handler(job):
 
     try:
         job_input = decrypt_secure_input(dict(raw_job_input))
+        transport_request = get_transport_request(job_input)
 
         output_format = job_input.get('output', 'file_path')
 
+        secure_source_image = get_secure_media_input(job_input, ['source_image'])
+        secure_source_video = get_secure_media_input(job_input, ['source_video'])
         image_path_input = job_input.get('image_path')
         image_url_input = job_input.get('image_url')
         image_base64_input = job_input.get('image_base64')
@@ -456,11 +631,17 @@ def handler(job):
         input_type = None
         task_type = None
 
-        if image_path_input or image_url_input or image_base64_input:
+        if secure_source_image or image_path_input or image_url_input or image_base64_input:
             input_type = 'image'
             task_type = 'image_upscale'
 
-            if image_path_input:
+            if secure_source_image:
+                input_path = decrypt_media_input_to_file(
+                    secure_source_image,
+                    os.path.abspath(os.path.join(task_id, 'source_image.bin'))
+                )
+                logger.info('Using secure media_inputs source image')
+            elif image_path_input:
                 input_path = image_path_input
             elif image_url_input:
                 try:
@@ -489,12 +670,18 @@ def handler(job):
                         file.write(base64.b64decode(image_base64_input))
                     logger.info(f'Saved base64 image to {input_path} using fallback extension')
 
-        elif video_path_input or video_url_input or video_base64_input:
+        elif secure_source_video or video_path_input or video_url_input or video_base64_input:
             input_type = 'video'
             task_type_input = job_input.get('task_type', 'upscale')
             task_type = 'video_upscale_and_interpolation' if task_type_input == 'upscale_and_interpolation' else 'video_upscale'
 
-            if video_path_input:
+            if secure_source_video:
+                input_path = decrypt_media_input_to_file(
+                    secure_source_video,
+                    os.path.abspath(os.path.join(task_id, 'source_video.bin'))
+                )
+                logger.info('Using secure media_inputs source video')
+            elif video_path_input:
                 input_path = video_path_input
             elif video_url_input:
                 try:
@@ -575,6 +762,45 @@ def handler(job):
 
         if not result_path:
             return {'error': f'Failed to create {input_type} output'}
+
+        if transport_request:
+            try:
+                secure_binding = job_input.get('__secure_binding', {}) or {}
+                job_id = secure_binding.get('job_id') or job_input.get('job_id') or job_input.get('jobId')
+                if not job_id:
+                    if isinstance(job.get('id'), str) and job.get('id'):
+                        job_id = job.get('id')
+                    elif isinstance(job.get('id'), dict):
+                        job_id = job.get('id').get('id') or job.get('id').get('jobId')
+                if not job_id:
+                    job_id = 'unknown-job'
+
+                attempt_id = secure_binding.get('attempt_id') or job_input.get('attempt_id') or 'unknown-attempt'
+                model_id = secure_binding.get('model_id') or job_input.get('model_id') or ('video-upscale' if input_type == 'video' else 'upscale')
+                output_path = os.path.join(transport_request['output_dir'], 'result.bin')
+
+                with open(result_path, 'rb') as file:
+                    result_bytes = file.read()
+
+                return {
+                    'transport_result': encrypt_result_to_transport(
+                        result_bytes,
+                        job_id,
+                        model_id,
+                        attempt_id,
+                        output_path,
+                        'video' if input_type == 'video' else 'image',
+                        'video/mp4' if input_type == 'video' else 'image/png'
+                    )
+                }
+            except Exception as transport_error:
+                logger.error(f'Transport result finalization failed in endpoint: {transport_error}')
+                return {
+                    'transport_result': normalize_transport_failure(
+                        'TRANSPORT_RESULT_WRITE_FAILED',
+                        str(transport_error)
+                    )
+                }
 
         if output_format == 'base64':
             try:

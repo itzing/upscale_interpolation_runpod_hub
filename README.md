@@ -6,7 +6,7 @@ This repository provides a RunPod Serverless worker for:
 - video upscale
 - video upscale plus frame interpolation
 
-It is adapted for Engui Studio and now supports the same secure request and result contract style used by `ZImage_runpod-zimage`.
+It is adapted for Engui Studio and supports both the legacy inline secure mode and the newer secure transport contract used by `ZImage_runpod-zimage`.
 
 ## Features
 
@@ -55,7 +55,20 @@ Use one of:
 
 ## Secure request contract
 
-When secure mode is enabled, Engui sends sensitive fields inside `_secure`.
+Two request modes are supported during migration.
+
+### New secure transport contract
+
+- structured `_secure` envelope with binding metadata
+- encrypted `media_inputs` for image/video source files
+- `transport_request.output_dir` under `/runpod-volume/secure-jobs/{jobId}/{attemptId}/outputs/`
+- result returned as `transport_result`
+
+This is the preferred mode for current Engui secure jobs.
+
+### Legacy inline secure contract
+
+When legacy secure mode is enabled, Engui sends sensitive fields inside `_secure`.
 
 ### `_secure` shape
 
@@ -91,6 +104,38 @@ engui:upscale-interpolation:v1
 The key must decode to exactly 32 bytes.
 
 ## Result contract
+
+### Preferred transport result
+
+When `transport_request.output_dir` is provided, the worker writes encrypted result bytes to that location and returns:
+
+```json
+{
+  "transport_result": {
+    "status": "completed",
+    "result_media": {
+      "kind": "image",
+      "mime": "image/png",
+      "storage_path": "/runpod-volume/secure-jobs/{jobId}/{attemptId}/outputs/result.bin",
+      "envelope": {
+        "v": 1,
+        "wrapped_key": "v1:...",
+        "nonce": "...",
+        "binding": {
+          "job_id": "...",
+          "model_id": "upscale",
+          "attempt_id": "...",
+          "direction": "endpoint_to_engui",
+          "role": "result",
+          "kind": "image"
+        }
+      }
+    }
+  }
+}
+```
+
+### Legacy inline result
 
 When `output=base64` and an encryption key is configured, the worker returns encrypted media blocks instead of plaintext media.
 
