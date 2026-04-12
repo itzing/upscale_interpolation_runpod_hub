@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
+import boto3
 import cv2
 import runpod
 import websocket
@@ -284,6 +285,42 @@ def resolve_secure_jobs_path(path_value):
     return candidates[-1]
 
 
+def secure_storage_path_to_s3_key(path_value):
+    if not path_value or not isinstance(path_value, str):
+        raise Exception('Secure storage path is missing')
+
+    normalized = path_value.lstrip('/')
+    if normalized.startswith('runpod-volume/'):
+        normalized = normalized[len('runpod-volume/'):]
+    return normalized
+
+
+def download_secure_media_input_from_s3(storage_path):
+    endpoint_url = os.getenv('S3_ENDPOINT_URL')
+    access_key_id = os.getenv('S3_ACCESS_KEY_ID')
+    secret_access_key = os.getenv('S3_SECRET_ACCESS_KEY')
+    bucket_name = os.getenv('S3_BUCKET_NAME')
+    region_name = (os.getenv('S3_REGION') or 'us-east-1').lower()
+
+    if not endpoint_url or not access_key_id or not secret_access_key or not bucket_name:
+        raise Exception('Secure media input is not mounted locally and S3 configuration is missing')
+
+    object_key = secure_storage_path_to_s3_key(storage_path)
+    client = boto3.client(
+        's3',
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        region_name=region_name,
+    )
+
+    try:
+        response = client.get_object(Bucket=bucket_name, Key=object_key)
+        return response['Body'].read()
+    except Exception as error:
+        raise Exception(f'Failed to download secure media input from S3 ({object_key}): {error}')
+
+
 def get_transport_request(job_input):
     transport_request = job_input.get('transport_request') or {}
     output_dir = transport_request.get('output_dir')
@@ -313,8 +350,12 @@ def decrypt_media_input_to_file(descriptor, output_file_path):
 
     resolved_storage_path = resolve_secure_jobs_path(storage_path)
 
-    with open(resolved_storage_path, 'rb') as input_file:
-        ciphertext_with_tag = input_file.read()
+    if os.path.exists(resolved_storage_path):
+        with open(resolved_storage_path, 'rb') as input_file:
+            ciphertext_with_tag = input_file.read()
+    else:
+        logger.info(f'Secure media input not mounted locally, downloading from S3: {storage_path}')
+        ciphertext_with_tag = download_secure_media_input_from_s3(storage_path)
 
     dek = unwrap_dek(key, wrapped_key)
     try:
