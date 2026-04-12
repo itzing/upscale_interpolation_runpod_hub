@@ -61,6 +61,13 @@ client_id = str(uuid.uuid4())
 WRAPPED_KEY_PREFIX = 'v1:'
 
 
+def build_secure_result_filename(job_id, attempt_id, extension='bin'):
+    safe_job_id = ''.join(char if char.isalnum() or char in '._-' else '_' for char in str(job_id or 'unknown-job'))
+    safe_attempt_id = ''.join(char if char.isalnum() or char in '._-' else '_' for char in str(attempt_id or 'unknown-attempt'))
+    safe_extension = ''.join(char for char in str(extension or 'bin') if char.isalnum()) or 'bin'
+    return f'{safe_job_id}__{safe_attempt_id}__result.{safe_extension}'
+
+
 def mask_job_input_for_log(job_input):
     masked = dict(job_input)
 
@@ -777,7 +784,10 @@ def handler(job):
 
                 attempt_id = secure_binding.get('attempt_id') or job_input.get('attempt_id') or 'unknown-attempt'
                 model_id = secure_binding.get('model_id') or job_input.get('model_id') or ('video-upscale' if input_type == 'video' else 'upscale')
-                output_path = os.path.join(transport_request['output_dir'], 'result.bin')
+                output_path = os.path.join(
+                    transport_request['output_dir'],
+                    build_secure_result_filename(job_id, attempt_id)
+                )
 
                 with open(result_path, 'rb') as file:
                     result_bytes = file.read()
