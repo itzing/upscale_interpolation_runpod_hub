@@ -267,16 +267,33 @@ def normalize_transport_failure(code, message):
     }
 
 
+def resolve_secure_jobs_path(path_value):
+    if not path_value or not isinstance(path_value, str):
+        return path_value
+
+    normalized = path_value.rstrip('/')
+    candidates = [normalized]
+    if normalized.startswith('/runpod-volume/secure-jobs/'):
+        candidates.append(normalized.replace('/runpod-volume/secure-jobs/', '/secure-jobs/', 1))
+    elif normalized.startswith('/secure-jobs/'):
+        candidates.append(normalized.replace('/secure-jobs/', '/runpod-volume/secure-jobs/', 1))
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[-1]
+
+
 def get_transport_request(job_input):
     transport_request = job_input.get('transport_request') or {}
     output_dir = transport_request.get('output_dir')
     if not output_dir or not isinstance(output_dir, str):
         return None
     output_dir = output_dir.rstrip('/')
-    if not output_dir.startswith('/runpod-volume/'):
-        raise Exception('transport_request.output_dir must be under /runpod-volume/')
+    if not output_dir.startswith(('/runpod-volume/', '/secure-jobs/')):
+        raise Exception('transport_request.output_dir must be under /runpod-volume/ or /secure-jobs/')
     return {
-        'output_dir': output_dir,
+        'output_dir': resolve_secure_jobs_path(output_dir),
     }
 
 
@@ -294,7 +311,9 @@ def decrypt_media_input_to_file(descriptor, output_file_path):
     if not storage_path or not binding or not wrapped_key or not nonce_b64:
         raise Exception('Secure media input descriptor is incomplete')
 
-    with open(storage_path, 'rb') as input_file:
+    resolved_storage_path = resolve_secure_jobs_path(storage_path)
+
+    with open(resolved_storage_path, 'rb') as input_file:
         ciphertext_with_tag = input_file.read()
 
     dek = unwrap_dek(key, wrapped_key)
@@ -626,6 +645,7 @@ def handler(job):
 
         secure_source_image = get_secure_media_input(job_input, ['source_image'])
         secure_source_video = get_secure_media_input(job_input, ['source_video'])
+        secure_flow_requested = bool(secure_source_image or secure_source_video or transport_request)
         image_path_input = job_input.get('image_path')
         image_url_input = job_input.get('image_url')
         image_base64_input = job_input.get('image_base64')
@@ -828,6 +848,9 @@ def handler(job):
                         logger.info('Returning encrypted video payload')
                         return {'video_encrypted': encrypted}
 
+                if secure_flow_requested:
+                    raise Exception('Encryption key not configured for secure upscale output')
+
                 logger.warning('Encryption key not configured, falling back to plaintext base64 output')
                 return {result_base64_key: result_data}
             except Exception as error:
@@ -835,6 +858,9 @@ def handler(job):
                 return {'error': f'Failed to encode {input_type} result: {error}'}
 
         logger.info(f'Original {input_type} result path: {result_path}')
+        if secure_flow_requested:
+            return {'error': 'Secure flow requires transport_result or encrypted base64 output'}
+
         try:
             runpod_volume_dir = '/runpod-volume'
             os.makedirs(runpod_volume_dir, exist_ok=True)
