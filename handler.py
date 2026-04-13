@@ -295,12 +295,13 @@ def secure_storage_path_to_s3_key(path_value):
     return normalized
 
 
-def download_secure_media_input_from_s3(storage_path):
-    endpoint_url = os.getenv('S3_ENDPOINT_URL')
-    access_key_id = os.getenv('S3_ACCESS_KEY_ID')
-    secret_access_key = os.getenv('S3_SECRET_ACCESS_KEY')
-    bucket_name = os.getenv('S3_BUCKET_NAME')
-    region_name = (os.getenv('S3_REGION') or 'us-east-1').lower()
+def download_secure_media_input_from_s3(storage_path, s3_config=None):
+    s3_config = s3_config or {}
+    endpoint_url = s3_config.get('endpoint_url') or os.getenv('S3_ENDPOINT_URL')
+    access_key_id = s3_config.get('access_key_id') or os.getenv('S3_ACCESS_KEY_ID')
+    secret_access_key = s3_config.get('secret_access_key') or os.getenv('S3_SECRET_ACCESS_KEY')
+    bucket_name = s3_config.get('bucket_name') or os.getenv('S3_BUCKET_NAME')
+    region_name = (s3_config.get('region') or os.getenv('S3_REGION') or 'us-east-1').lower()
 
     if not endpoint_url or not access_key_id or not secret_access_key or not bucket_name:
         raise Exception('Secure media input is not mounted locally and S3 configuration is missing')
@@ -329,12 +330,20 @@ def get_transport_request(job_input):
     output_dir = output_dir.rstrip('/')
     if not output_dir.startswith(('/runpod-volume/', '/secure-jobs/')):
         raise Exception('transport_request.output_dir must be under /runpod-volume/ or /secure-jobs/')
+    s3 = transport_request.get('s3') or {}
     return {
         'output_dir': resolve_secure_jobs_path(output_dir),
+        's3': {
+            'endpoint_url': s3.get('endpoint_url'),
+            'access_key_id': s3.get('access_key_id'),
+            'secret_access_key': s3.get('secret_access_key'),
+            'bucket_name': s3.get('bucket_name'),
+            'region': s3.get('region'),
+        }
     }
 
 
-def decrypt_media_input_to_file(descriptor, output_file_path):
+def decrypt_media_input_to_file(descriptor, output_file_path, s3_config=None):
     key = decode_encryption_key()
     if not key:
         raise Exception('Secure media input received but FIELD_ENC_KEY_B64 is missing')
@@ -355,7 +364,7 @@ def decrypt_media_input_to_file(descriptor, output_file_path):
             ciphertext_with_tag = input_file.read()
     else:
         logger.info(f'Secure media input not mounted locally, downloading from S3: {storage_path}')
-        ciphertext_with_tag = download_secure_media_input_from_s3(storage_path)
+        ciphertext_with_tag = download_secure_media_input_from_s3(storage_path, s3_config)
 
     dek = unwrap_dek(key, wrapped_key)
     try:
@@ -706,7 +715,8 @@ def handler(job):
             if secure_source_image:
                 input_path = decrypt_media_input_to_file(
                     secure_source_image,
-                    os.path.abspath(os.path.join(task_id, 'source_image.bin'))
+                    os.path.abspath(os.path.join(task_id, 'source_image.bin')),
+                    transport_request.get('s3') if transport_request else None,
                 )
                 logger.info('Using secure media_inputs source image')
             elif image_path_input:
@@ -746,7 +756,8 @@ def handler(job):
             if secure_source_video:
                 input_path = decrypt_media_input_to_file(
                     secure_source_video,
-                    os.path.abspath(os.path.join(task_id, 'source_video.bin'))
+                    os.path.abspath(os.path.join(task_id, 'source_video.bin')),
+                    transport_request.get('s3') if transport_request else None,
                 )
                 logger.info('Using secure media_inputs source video')
             elif video_path_input:
