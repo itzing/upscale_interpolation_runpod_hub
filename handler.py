@@ -329,8 +329,12 @@ def get_transport_request(job_input):
     output_dir = output_dir.rstrip('/')
     if not output_dir.startswith(('/runpod-volume/', '/secure-jobs/')):
         raise Exception('transport_request.output_dir must be under /runpod-volume/ or /secure-jobs/')
+    output_file_name = transport_request.get('output_file_name')
+    if output_file_name is not None and (not isinstance(output_file_name, str) or not output_file_name.strip()):
+        raise Exception('transport_request.output_file_name must be a non-empty string when provided')
     return {
         'output_dir': resolve_secure_jobs_path(output_dir),
+        'output_file_name': output_file_name.strip() if isinstance(output_file_name, str) else None,
     }
 
 
@@ -845,9 +849,10 @@ def handler(job):
 
                 attempt_id = secure_binding.get('attempt_id') or job_input.get('attempt_id') or 'unknown-attempt'
                 model_id = secure_binding.get('model_id') or job_input.get('model_id') or ('video-upscale' if input_type == 'video' else 'upscale')
+                output_file_name = transport_request.get('output_file_name') or build_secure_result_filename(job_id, attempt_id)
                 output_path = os.path.join(
                     transport_request['output_dir'],
-                    build_secure_result_filename(job_id, attempt_id)
+                    output_file_name
                 )
 
                 with open(result_path, 'rb') as file:
