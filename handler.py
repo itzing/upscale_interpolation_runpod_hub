@@ -838,7 +838,8 @@ def handler(job):
         if transport_request:
             try:
                 secure_binding = job_input.get('__secure_binding', {}) or {}
-                job_id = secure_binding.get('job_id') or job_input.get('job_id') or job_input.get('jobId')
+                media_binding = ((secure_source_image or secure_source_video) or {}).get('envelope', {}).get('binding', {}) or {}
+                job_id = secure_binding.get('job_id') or media_binding.get('job_id') or job_input.get('job_id') or job_input.get('jobId')
                 if not job_id:
                     if isinstance(job.get('id'), str) and job.get('id'):
                         job_id = job.get('id')
@@ -847,8 +848,8 @@ def handler(job):
                 if not job_id:
                     job_id = 'unknown-job'
 
-                attempt_id = secure_binding.get('attempt_id') or job_input.get('attempt_id') or 'unknown-attempt'
-                model_id = secure_binding.get('model_id') or job_input.get('model_id') or ('video-upscale' if input_type == 'video' else 'upscale')
+                attempt_id = secure_binding.get('attempt_id') or media_binding.get('attempt_id') or job_input.get('attempt_id') or 'unknown-attempt'
+                model_id = secure_binding.get('model_id') or media_binding.get('model_id') or job_input.get('model_id') or ('video-upscale' if input_type == 'video' else 'upscale')
                 output_file_name = transport_request.get('output_file_name') or build_secure_result_filename(job_id, attempt_id)
                 output_path = os.path.join(
                     transport_request['output_dir'],
